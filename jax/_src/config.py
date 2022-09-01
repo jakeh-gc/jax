@@ -381,7 +381,8 @@ class Config:
       axis_env_state = context.axis_env_state
     return (axis_env_state, self.x64_enabled, self.jax_numpy_rank_promotion,
             self.jax_default_matmul_precision, self.jax_dynamic_shapes,
-            self.jax_numpy_dtype_promotion, self.jax_default_device)
+            self.jax_numpy_dtype_promotion, self.jax_default_device,
+            self.jax_array)
 
 class NoDefault: pass
 no_default = NoDefault()
@@ -654,6 +655,7 @@ parallel_functions_output_gda = config.define_bool_state(
 jax_array = config.define_bool_state(
     name='jax_array',
     default=False,
+    upgrade=True,
     help=('If True, new pjit behavior will be enabled and `jax.Array` will be '
           'used.'))
 
@@ -893,7 +895,7 @@ config.define_bool_state(
 # TODO(sharadmv,mattjj): set default to True, then remove
 config.define_bool_state(
     name='jax_eager_pmap',
-    default=False,
+    default=True,
     upgrade=True,
     help='Enable eager-mode pmap when jax_disable_jit is activated.')
 

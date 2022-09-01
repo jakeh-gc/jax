@@ -49,6 +49,7 @@ from jax._src.lax import lax as lax_internal
 from jax._src.numpy.lax_numpy import _promote_dtypes, _promote_dtypes_inexact
 from jax._src.numpy.util import _parse_numpydoc, ParsedDoc, _wraps
 from jax._src.util import prod, safe_zip
+from jax.experimental import array
 
 from jax.config import config
 config.parse_flags_with_absl()
@@ -669,7 +670,11 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     arr = jnp.array(data)
     other = othertype(data)
 
-    msg = f"unsupported operand type.* 'DeviceArray' and '{othertype.__name__}'"
+    if config.jax_array:
+      val_str = 'Array'
+    else:
+      val_str = 'DeviceArray'
+    msg = f"unsupported operand type.* '{val_str}' and '{othertype.__name__}'"
     with self.assertRaisesRegex(TypeError, msg):
       getattr(arr, name)(other)
 
@@ -684,7 +689,11 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     arr = jnp.array(data)
     other = othertype(data)
 
-    msg = f"unsupported operand type.* '{othertype.__name__}' and 'DeviceArray'"
+    if config.jax_array:
+      val_str = 'Array'
+    else:
+      val_str = 'DeviceArray'
+    msg = f"unsupported operand type.* '{othertype.__name__}' and '{val_str}'"
     with self.assertRaisesRegex(TypeError, msg):
       getattr(arr, name)(other)
 
@@ -1602,8 +1611,6 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
       for shape2 in all_shapes
       for assume_unique in [False, True]
       for return_indices in [False, True]))
-  # TODO(b/242043996): compilation doesn't terminate (LLVM bug?)
-  @jtu.skip_on_devices("cpu")
   def testIntersect1d(self, shape1, dtype1, shape2, dtype2, assume_unique, return_indices):
     rng = jtu.rand_default(self.rng())
     args_maker = lambda: [rng(shape1, dtype1), rng(shape2, dtype2)]
@@ -2750,7 +2757,11 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     expected_np_input_after_call = np.ones(1)
     expected_jnp_input_after_call = jnp.ones(1)
 
-    self.assertTrue(device_array.type_is_device_array(jnp.concatenate([np_input])))
+    out = jnp.concatenate([np_input])
+    if config.jax_array:
+      self.assertIs(type(out), array.Array)
+    else:
+      self.assertTrue(device_array.type_is_device_array(out))
 
     attempt_sideeffect(np_input)
     attempt_sideeffect(jnp_input)
@@ -3337,7 +3348,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     if numpy_version < (1, 24):
         np_fun = _promote_like_jnp(lambda *args: np.stack(*args, axis=axis).astype(out_dtype))
     else:
-        np_fun = _promote_like_jnp(partial(np.stack, axis=axis, dtype=out_dtype))
+        np_fun = _promote_like_jnp(partial(np.stack, axis=axis, dtype=out_dtype, casting='unsafe'))
 
     jnp_fun = partial(jnp.stack, axis=axis, dtype=out_dtype)
     with jtu.strict_promotion_if_dtypes_match(dtypes):
@@ -4003,6 +4014,9 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
       for dtype in all_dtypes
       for func in ["array", "copy", "copy.copy", "copy.deepcopy"]))
   def testArrayCopy(self, dtype, func):
+    # TODO(https://github.com/google/jax/issues/12016): Make this work with Array.
+    if config.jax_array:
+      raise unittest.SkipTest("Does not work with Array.")
     x = jnp.ones(10, dtype=dtype)
     if func == "copy.deepcopy":
       copy_func = copy.deepcopy
@@ -4096,13 +4110,20 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     assert not np.isscalar(jnp.array(3))
 
   def testArrayOutputsDeviceArrays(self):
-    assert device_array.type_is_device_array(jnp.array([]))
-    assert device_array.type_is_device_array(jnp.array(np.array([])))
+    if config.jax_array:
+      assert type(jnp.array([])) is array.Array
+      assert type(jnp.array(np.array([]))) is array.Array
+    else:
+      assert device_array.type_is_device_array(jnp.array([]))
+      assert device_array.type_is_device_array(jnp.array(np.array([])))
 
     class NDArrayLike:
       def __array__(self, dtype=None):
         return np.array([], dtype=dtype)
-    assert device_array.type_is_device_array(jnp.array(NDArrayLike()))
+    if config.jax_array:
+      assert type(jnp.array(NDArrayLike())) is array.Array
+    else:
+      assert device_array.type_is_device_array(jnp.array(NDArrayLike()))
 
     # NOTE(mattjj): disabled b/c __array__ must produce ndarrays
     # class DeviceArrayLike:

@@ -86,7 +86,7 @@ class DLPackTest(jtu.JaxTestCase):
     device = jax.devices("gpu" if gpu else "cpu")[0]
     x = jax.device_put(np, device)
     dlpack = jax.dlpack.to_dlpack(x, take_ownership=take_ownership)
-    self.assertEqual(take_ownership, x.device_buffer.is_deleted())
+    self.assertEqual(take_ownership, x.is_deleted())
     y = jax.dlpack.from_dlpack(dlpack)
     self.assertEqual(y.device(), device)
     self.assertAllClose(np.astype(x.dtype), y)
@@ -238,6 +238,8 @@ class CudaArrayInterfaceTest(jtu.JaxTestCase):
      for dtype in dlpack_dtypes))
   @unittest.skipIf(not cupy, "Test requires CuPy")
   def testJaxToCuPy(self, shape, dtype):
+    if dtype == jnp.bfloat16:
+      raise unittest.SkipTest("cupy does not support bfloat16")
     rng = jtu.rand_default(self.rng())
     x = rng(shape, dtype)
     y = jnp.array(x)

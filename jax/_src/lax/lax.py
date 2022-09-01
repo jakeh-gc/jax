@@ -49,7 +49,7 @@ from jax._src import util
 from jax._src.util import (cache, prod, safe_zip, safe_map, canonicalize_axis,
                            split_list)
 from jax.tree_util import tree_map
-import jax._src.lib
+from jax._src.lib import mlir_api_version
 from jax._src.lib import pytree
 from jax._src.lib import xla_bridge
 from jax._src.lib import xla_client
@@ -544,6 +544,8 @@ def convert_element_type(operand: Array, new_dtype: DType) -> Array:
 
 def _convert_element_type(operand: Array, new_dtype: Optional[DType] = None,
                           weak_type: bool = False):
+  from jax.experimental import array
+
   # Don't canonicalize old_dtype because x64 context might cause
   # un-canonicalized operands to be passed in.
   old_dtype = dtypes.dtype(operand, canonicalize=False)
@@ -571,7 +573,7 @@ def _convert_element_type(operand: Array, new_dtype: Optional[DType] = None,
     old_weak_type = False
 
   if ((old_dtype, old_weak_type) == (new_dtype, new_weak_type)
-      and isinstance(operand, (core.Tracer, device_array.DeviceArray))):
+      and isinstance(operand, (core.Tracer, device_array.DeviceArray, array.Array))):
     return operand
   else:
     return convert_element_type_p.bind(operand, new_dtype=new_dtype,
@@ -790,8 +792,10 @@ def broadcast_in_dim(operand: Array, shape: Shape,
   See Also:
     jax.lax.broadcast : simpler interface to add new leading dimensions.
   """
+  from jax.experimental import array
+
   if (np.ndim(operand) == len(shape) and not len(broadcast_dimensions)
-      and isinstance(operand, (device_array.DeviceArray, core.Tracer))):
+      and isinstance(operand, (device_array.DeviceArray, core.Tracer, array.Array))):
     return operand
   if config.jax_dynamic_shapes:
     # We must gate this behavior under a flag because otherwise the errors
@@ -846,6 +850,8 @@ def reshape(operand: Array, new_sizes: Shape,
     >>> reshape(y, (6,), (1, 0))
     DeviceArray([0, 3, 1, 4, 2, 5], dtype=int32)
   """
+  from jax.experimental import array
+
   new_sizes = canonicalize_shape(new_sizes)  # TODO
   new_sizes = tuple(new_sizes)
   same_shape = core.symbolic_equal_shape(np.shape(operand), new_sizes)
@@ -856,7 +862,7 @@ def reshape(operand: Array, new_sizes: Shape,
     dims = api_util._ensure_index_tuple(dimensions)
     same_dims = tuple(dims) == tuple(range(np.ndim(operand)))
   if (np.shape(operand) and same_shape and same_dims
-      and isinstance(operand, (core.Tracer, device_array.DeviceArray))):
+      and isinstance(operand, (core.Tracer, device_array.DeviceArray, array.Array))):
     return operand
   else:
     dyn_shape, static_new_sizes = _extract_tracers_dyn_shape(new_sizes)
@@ -1032,19 +1038,19 @@ def _get_monoid_reducer(monoid_op: Callable,
     # allow bitwise reductions for boolean and integer types
     _is_intlike = dtype == np.bool_ or dtypes.issubdtype(dtype, np.integer)
     if monoid_op is add:
-      return np.equal(aval.val, 0) and partial(_reduce_sum)
+      return _reduce_sum if np.equal(aval.val, 0) else None
     elif monoid_op is mul:
-      return np.equal(aval.val, 1) and _reduce_prod
+      return _reduce_prod if np.equal(aval.val, 1) else None
     elif monoid_op is bitwise_or and _is_intlike:
-      return np.equal(aval.val, _get_bitwise_or_identity(dtype)) and _reduce_or
+      return _reduce_or if np.equal(aval.val, _get_bitwise_or_identity(dtype)) else None
     elif monoid_op is bitwise_and and _is_intlike:
-      return np.equal(aval.val, _get_bitwise_and_identity(dtype)) and _reduce_and
+      return _reduce_and if np.equal(aval.val, _get_bitwise_and_identity(dtype)) else None
     elif monoid_op is bitwise_xor and _is_intlike:
-      return np.equal(aval.val, _get_bitwise_or_identity(dtype)) and _reduce_xor
+      return _reduce_xor if np.equal(aval.val, _get_bitwise_or_identity(dtype)) else None
     elif monoid_op is max:
-      return np.equal(aval.val, _get_max_identity(dtype)) and _reduce_max
+      return _reduce_max if np.equal(aval.val, _get_max_identity(dtype)) else None
     elif monoid_op is min:
-      return np.equal(aval.val, _get_min_identity(dtype)) and _reduce_min
+      return _reduce_min if np.equal(aval.val, _get_min_identity(dtype)) else None
   return None
 
 def _get_bitwise_and_identity(dtype: DType) -> Array:
@@ -1239,11 +1245,14 @@ def stop_gradient(x: T) -> T:
   DeviceArray(0., dtype=float32, weak_type=True)
   """
   def stop(x):
-    if (dtypes.issubdtype(_dtype(x), np.floating) or
+    # only bind primitive on inexact dtypes, to avoid some staging
+    if core.has_opaque_dtype(x):
+      return x
+    elif (dtypes.issubdtype(_dtype(x), np.floating) or
         dtypes.issubdtype(_dtype(x), np.complexfloating)):
       return ad_util.stop_gradient_p.bind(x)
     else:
-      return x  # only bind primitive on inexact dtypes, to avoid some staging
+      return x
   return tree_map(stop, x)
 
 def reduce_precision(operand: Union[float, Array],
@@ -1263,7 +1272,7 @@ def squeeze(array: Array, dimensions: Sequence[int]) -> Array:
   """Squeeze any number of size 1 dimensions from an array."""
   ndim = np.ndim(array)
   dimensions = tuple(sorted(canonicalize_axis(i, ndim) for i in dimensions))
-  if not dimensions:
+  if not dimensions and isinstance(array, (core.Tracer, device_array.DeviceArray)):
     return array
   return squeeze_p.bind(array, dimensions=dimensions)
 
@@ -1504,7 +1513,7 @@ def naryop_dtype_rule(result_dtype, accepted_dtypes, name, *avals, **kwargs):
   return result_dtype(*avals)
 
 
-def _broadcasting_shape_rule(name, *avals):
+def broadcasting_shape_rule(name, *avals):
   shapes = [aval.shape for aval in avals if aval.shape]
   if not shapes:
     return ()
@@ -1545,7 +1554,7 @@ def _naryop_weak_type_rule(name, *avals, **kwargs):
 
 def naryop(result_dtype, accepted_dtypes, name):
   dtype_rule = partial(naryop_dtype_rule, result_dtype, accepted_dtypes, name)
-  shape_rule = partial(_broadcasting_shape_rule, name)
+  shape_rule = partial(broadcasting_shape_rule, name)
   weak_type_rule = partial(_naryop_weak_type_rule, name)
   prim = standard_primitive(shape_rule, dtype_rule, name,
                             weak_type_rule=weak_type_rule)
@@ -1689,19 +1698,6 @@ ceil_p = standard_unop(_float, 'ceil')
 ad.defjvp_zero(ceil_p)
 mlir.register_lowering(ceil_p, partial(_nary_lower_mhlo, mhlo.CeilOp))
 
-def _round_to_nearest_even(x):
-  half = _const(x, 0.5)
-  one = _const(x, 1)
-  round_val = floor(x)
-  fraction = x - round_val
-  nearest_even_int = sub(
-    round_val, mul(_const(x, 2), floor(mul(half, x))))
-  is_odd = eq(nearest_even_int, one)
-  return select(
-    bitwise_or(gt(fraction, half),
-               bitwise_and(eq(fraction, half), is_odd)),
-    add(round_val, one), round_val)
-
 round_p = standard_unop(_float, 'round')
 ad.defjvp_zero(round_p)
 
@@ -1710,9 +1706,7 @@ def _round_lower(ctx, x, *, rounding_method):
     return mhlo.RoundOp(x).results
   else:
     assert rounding_method is RoundingMethod.TO_NEAREST_EVEN
-    round_nearest = mlir.cache_lowering(mlir.lower_fun(_round_to_nearest_even,
-                                                       multiple_results=False))
-    return round_nearest(ctx, x)
+    return mhlo.RoundNearestEvenOp(x).results
 mlir.register_lowering(round_p, _round_lower)
 
 is_finite_p = unop(_fixed_dtype(np.bool_), _float, 'is_finite')
@@ -1744,14 +1738,14 @@ mlir.register_lowering(tanh_p, partial(_nary_lower_mhlo, mhlo.TanhOp))
 
 sin_p = standard_unop(_float | _complex, 'sin')
 ad.defjvp(sin_p, lambda g, x: mul(g, cos(x)))
-if jax._src.lib.mlir_api_version < 27:
+if mlir_api_version < 27:
   mlir.register_lowering(sin_p, partial(_nary_lower_mhlo, mhlo.SinOp))
 else:
   mlir.register_lowering(sin_p, partial(_nary_lower_mhlo, mhlo.SineOp))
 
 cos_p = standard_unop(_float | _complex, 'cos')
 ad.defjvp(cos_p, lambda g, x: neg(mul(g, sin(x))))
-if jax._src.lib.mlir_api_version < 28:
+if mlir_api_version < 28:
   mlir.register_lowering(cos_p, partial(_nary_lower_mhlo, mhlo.CosOp))
 else:
   mlir.register_lowering(cos_p, partial(_nary_lower_mhlo, mhlo.CosineOp))
@@ -1773,7 +1767,7 @@ def asin_impl(x):
 
 asin_p = standard_unop(_float | _complex, 'asin')
 ad.defjvp(asin_p, lambda g, x: mul(g, rsqrt(_const(x, 1) - square(x))))
-if jax._src.lib.mlir_api_version < 31:
+if mlir_api_version < 31:
   mlir.register_lowering(asin_p, mlir.lower_fun(asin_impl,
                                                 multiple_results=False))
 else:
@@ -1806,7 +1800,7 @@ def atan_impl(x):
 
 atan_p = standard_unop(_float | _complex, 'atan')
 ad.defjvp(atan_p, lambda g, x: div(g, _const(x, 1) + square(x)))
-if jax._src.lib.mlir_api_version < 31:
+if mlir_api_version < 31:
   mlir.register_lowering(atan_p, mlir.lower_fun(atan_impl,
                                                 multiple_results=False))
 else:
@@ -1901,7 +1895,7 @@ ad.defjvp2(bessel_i0e_p, lambda g, y, x: g * (bessel_i1e(x) - sign(x) * y))
 
 bessel_i1e_p = standard_unop(_float, 'bessel_i1e')
 xla.register_translation(bessel_i1e_p, standard_translate(bessel_i1e_p))
-if jax._src.lib.mlir_api_version < 32:
+if mlir_api_version < 32:
   xla.register_translation(bessel_i1e_p, standard_translate(bessel_i1e_p))
 else:
   mlir.register_lowering(bessel_i1e_p,
@@ -2016,8 +2010,7 @@ mlir.register_lowering(cbrt_p, partial(_nary_lower_mhlo, mhlo.CbrtOp))
 pow_p = standard_naryop([_float | _complex, _float | _complex], 'pow')
 
 def _pow_jvp_lhs(g, ans, x, y):
-  jac = mul(y, pow(x, select(eq(y, _zeros(y)), _ones(y), sub(y, _ones(y)))))
-  return mul(g, jac)
+  return mul(g, mul(y, pow(x, sub(y, _ones(y)))))
 
 def _pow_jvp_rhs(g, ans, x, y):
   return mul(g, mul(log(_replace_zero(x)), ans))
@@ -2160,7 +2153,7 @@ def _sub_transpose(t, x, y):
 sub_p = standard_naryop([_num, _num], 'sub')
 ad.primitive_jvps[sub_p] = _sub_jvp
 ad.primitive_transposes[sub_p] = _sub_transpose
-if jax._src.lib.mlir_api_version < 29:
+if mlir_api_version < 29:
   mlir.register_lowering(sub_p, partial(_nary_lower_mhlo, mhlo.SubOp))
 else:
   mlir.register_lowering(sub_p, partial(_nary_lower_mhlo, mhlo.SubtractOp))
@@ -2833,8 +2826,8 @@ def _broadcast_in_dim_partial_eval(
 
 def _broadcast_in_dim_lower(ctx, x, *dyn_shape, shape, broadcast_dimensions):
   aval_out, = ctx.avals_out
-  if type(aval_out.dtype) in core.custom_eltypes:
-    return aval_out.dtype.broadcast_in_dim_mlir(
+  if core.is_opaque_dtype(aval_out.dtype):
+    return aval_out.dtype._rules.broadcast_in_dim_mlir(
         ctx, x, *dyn_shape, shape=shape,
         broadcast_dimensions=broadcast_dimensions)
   if dyn_shape:
@@ -2951,7 +2944,7 @@ ad.defjvp(clamp_p,
           lambda g, min, operand, max:
           select(lt(max, operand), g, _zeros(operand)))
 batching.primitive_batchers[clamp_p] = _clamp_batch_rule
-if jax._src.lib.mlir_api_version < 30:
+if mlir_api_version < 30:
   mlir.register_lowering(
       clamp_p, partial(_nary_lower_mhlo, mhlo.ClampOp, explicit_type=True))
 else:
@@ -3317,8 +3310,8 @@ def _transpose_batch_rule(batched_args, batch_dims, *, permutation):
 
 def _transpose_lower(ctx, x, *, permutation):
   aval_out, = ctx.avals_out
-  if type(aval_out.dtype) in core.custom_eltypes:
-    return aval_out.dtype.transpose_mlir(ctx, x, permutation=permutation)
+  if core.is_opaque_dtype(aval_out.dtype):
+    return aval_out.dtype._rules.transpose_mlir(ctx, x, permutation=permutation)
   return mhlo.TransposeOp(x, mlir.dense_int_elements(permutation)).results
 
 transpose_p = standard_primitive(_transpose_shape_rule, _input_dtype,
@@ -4229,7 +4222,7 @@ def _rng_uniform_lowering(ctx, a, b, *, shape):
   aval_out, = ctx.avals_out
   shape, = mlir.ir_constants(np.array(aval_out.shape, np.int64),
                              canonicalize_types=False)
-  if jax._src.lib.mlir_api_version <= 22:
+  if mlir_api_version <= 22:
     return mhlo.RngUniformOp(a, b, shape).results
   else:
     return mhlo.RngOp(a, b, shape,
@@ -4333,6 +4326,7 @@ copy_p.def_impl(partial(xla.apply_primitive, copy_p))
 copy_p.def_abstract_eval(lambda x: x)
 mlir.register_lowering(copy_p, lambda ctx, x: [x])
 ad.deflinear(copy_p, lambda t: [copy_p.bind(t)])
+pe.def_trivial_padding(copy_p)
 batching.defvectorized(copy_p)
 
 
@@ -4563,7 +4557,7 @@ def _check_same_dtypes(name, ignore_fp_precision, *ttypes):
   """Check that dtypes agree, possibly ignoring float precision."""
   # the `ignore_fp_precision` flag exists because the XLA shape inference logic
   # allows mixed floating point precision, but the HLO verifier often rejects it
-  if any(type(t) in core.custom_eltypes for t in ttypes):
+  if any(core.is_opaque_dtype(t) for t in ttypes):
     return  # TODO(mattjj,frostig): do some checking, friend
   types = map(np.dtype, ttypes)  # canonicalize
   if ignore_fp_precision:
@@ -4726,12 +4720,12 @@ def _check_user_dtype_supported(dtype, fun_name=None):
     warnings.warn(msg.format(dtype, fun_name , truncated_dtype), stacklevel=3)
 
 
-def empty(eltype):
-  return empty_p.bind(eltype=eltype)
+def empty(dtype):
+  return empty_p.bind(dtype=dtype)
 empty_p = core.Primitive('empty')
-empty_p.def_abstract_eval(lambda *, eltype: core.ShapedArray((), eltype))
-def _empty_lower(ctx, *, eltype):
-  if type(eltype) in core.custom_eltypes:
-    return eltype.empty_mlir(ctx)
-  return mlir.ir_constants(np.zeros((), np.dtype(eltype)))
+empty_p.def_abstract_eval(lambda *, dtype: core.ShapedArray((), dtype))
+def _empty_lower(ctx, *, dtype):
+  if core.is_opaque_dtype(dtype):
+    return dtype._rules.empty_mlir(ctx)
+  return mlir.ir_constants(np.zeros((), np.dtype(dtype)))
 mlir.register_lowering(empty_p, _empty_lower)

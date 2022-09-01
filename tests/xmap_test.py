@@ -41,9 +41,13 @@ from jax.experimental.pjit import pjit, with_sharding_constraint
 from jax.experimental.pjit import PartitionSpec as P
 from jax.experimental.maps import xmap, serial_loop, SerialLoop
 from jax.errors import JAXTypeError
+from jax._src import config as jax_config
+from jax._src.nn import initializers as nn_initializers
 from jax._src.lib import xla_bridge
 from jax._src.lib import xla_client
+from jax._src.lib import xla_extension_version
 from jax._src.util import curry, unzip2, prod, safe_zip
+from jax._src.lax import parallel as lax_parallel
 from jax._src.lax.parallel import pgather
 from jax.interpreters import batching, pxla
 from jax.ad_checkpoint import checkpoint
@@ -108,8 +112,8 @@ def _ensure_bdim_batcher(axis_size, frame_name, main_type, vals_in, dims_in, axi
   return jnp.moveaxis(v, d, bdim), bdim
 batching.axis_primitive_batchers[ensure_bdim_p] = _ensure_bdim_batcher
 batching.primitive_batchers[ensure_bdim_p] = lambda v, d: (v[0], d[0])
-core.axis_substitution_rules[ensure_bdim_p] = partial(jax._src.lax.parallel._subst_all_names_in_param,
-                                                      'axis_name')
+core.axis_substitution_rules[ensure_bdim_p] = partial(
+    lax_parallel._subst_all_names_in_param, 'axis_name')
 
 def ensure_bdim(x, axis_name, bdim):
   return ensure_bdim_p.bind(x, axis_name=(axis_name,), bdim=bdim)
@@ -827,6 +831,8 @@ class XMapTestManualSPMD(ManualSPMDTestMixin, XMapTestCase):
     ))
   @jtu.with_mesh_from_kwargs
   def testCollective(self, mesh):
+    if xla_extension_version < 85:
+      raise SkipTest("Need use_global_device_ids in AllReduceOp")
     all_axes = tuple(axis[0] for axis in mesh)
     f = xmap(lambda x: lax.psum(x, 'i'), in_axes=['i', 'j'], out_axes=['j'],
              axis_resources=dict(zip('ij', all_axes)))
@@ -935,8 +941,7 @@ class NamedNNTest(XMapTestCase):
     for distr in ['uniform', 'normal', 'truncated_normal']))
   def testVarianceScaling(self, map_in, map_out, fan, distr):
     shape = (80, 50, 7)
-    fan_in, fan_out = jax._src.nn.initializers._compute_fans(
-        NamedShape(*shape), 0, 1)
+    fan_in, fan_out = nn_initializers._compute_fans(NamedShape(*shape), 0, 1)
     key = jax.random.PRNGKey(1)
     base_scaling = partial(jax.nn.initializers.variance_scaling, 100, fan, distr)
     ref_sampler = lambda: base_scaling(in_axis=0, out_axis=1)(key, shape)
@@ -974,7 +979,7 @@ class XMapGDATest(XMapTestCase):
     gda_obj = global_device_array.GlobalDeviceArray.from_callback(
         global_input_shape, global_mesh, mesh_axes, cb)
 
-    with jax._src.config.parallel_functions_output_gda(True):
+    with jax_config.parallel_functions_output_gda(True):
       f = maps.xmap(
             lambda x: x,
             in_axes=({0: "a", 1: "b"}),
@@ -1002,7 +1007,7 @@ class XMapGDATest(XMapTestCase):
     gda_obj = global_device_array.GlobalDeviceArray.from_callback(
         global_input_shape, global_mesh, mesh_axes, cb)
 
-    with jax._src.config.parallel_functions_output_gda(True):
+    with jax_config.parallel_functions_output_gda(True):
       f = maps.xmap(
             lambda x, y: (x @ x.T, y @ y.T),
             in_axes=({0: "a"}, ["c", ...]),
@@ -1043,7 +1048,7 @@ class XMapGDATest(XMapTestCase):
     gda_obj2 = global_device_array.GlobalDeviceArray.from_callback(
         global_input_shape, global_mesh, P('y'), cb)
 
-    with jax._src.config.parallel_functions_output_gda(True):
+    with jax_config.parallel_functions_output_gda(True):
       f = maps.xmap(
             lambda x, y: (x @ x.T, y @ y.T),
             in_axes=({0: "a"}, ["c", ...]),
@@ -1080,7 +1085,7 @@ class XMapGDATest(XMapTestCase):
     gda_obj = global_device_array.GlobalDeviceArray.from_callback(
         global_input_shape, global_mesh, mesh_axes, cb)
 
-    with jax._src.config.parallel_functions_output_gda(True):
+    with jax_config.parallel_functions_output_gda(True):
       f = maps.xmap(
             lambda x: x @ x.T,
             in_axes=({0: "a"}),
@@ -1102,7 +1107,7 @@ class XMapArrayTest(XMapTestCase):
     input_array, input_data = create_array(global_input_shape, global_mesh,
                                            mesh_axes)
 
-    with jax._src.config.jax_array(True):
+    with jax_config.jax_array(True):
       with global_mesh:
         f = maps.xmap(
               lambda x: x,
@@ -1118,32 +1123,13 @@ class XMapArrayTest(XMapTestCase):
         for s in out.addressable_shards:
           self.assertArraysEqual(s.data._arrays[0], input_data[s.index])
 
-  def test_xmap_array_mixed_inputs(self):
-    global_mesh = jtu.create_global_mesh((4, 2), ('x', 'y'))
-    global_input_shape = (8, 2)
-    mesh_axes = P('x')
-    input_array, input_data = create_array(global_input_shape, global_mesh,
-                                           mesh_axes)
-
-    with jax._src.config.jax_array(True):
-      with global_mesh:
-        f = maps.xmap(
-              lambda x, y: (x @ x.T, y @ y.T),
-              in_axes=({0: "a"}, ["c", ...]),
-              out_axes=({0: "a"}, ["c", ...]),
-              axis_resources={"a": "x", "c": "x"})
-        with self.assertRaisesRegex(
-            ValueError, ('All arguments to pjit when `config.jax_array` is '
-                         'enabled should be `Array`s.')):
-          f(input_array, input_data)
-
   def test_xmap_array_double_input(self):
     global_mesh = jtu.create_global_mesh((4, 2), ('x', 'y'))
     global_input_shape = (8, 2)
     a1, input_data = create_array(global_input_shape, global_mesh, P('x'))
     a2, _ = create_array(global_input_shape, global_mesh, P('y'))
 
-    with jax._src.config.jax_array(True):
+    with jax_config.jax_array(True):
       with global_mesh:
         f = maps.xmap(
               lambda x, y: (x @ x.T, y @ y.T),
@@ -1175,7 +1161,7 @@ class XMapArrayTest(XMapTestCase):
     input_array, _ = create_array(global_input_shape, global_mesh,
                                            mesh_axes)
 
-    with jax._src.config.jax_array(True):
+    with jax_config.jax_array(True):
       with global_mesh:
         f = maps.xmap(
               lambda x: x @ x.T,

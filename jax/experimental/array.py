@@ -14,11 +14,13 @@
 
 from __future__ import annotations
 
-import operator
+import operator as op
 import numpy as np
-from typing import Sequence, Tuple, Callable, Union, Optional, cast, List
+from typing import (Sequence, Tuple, Callable, Union, Optional, cast, List,
+                    NamedTuple, Mapping)
 
 from jax import core
+from jax._src import abstract_arrays
 from jax._src import ad_util
 from jax._src import api_util
 from jax._src import dispatch
@@ -28,15 +30,22 @@ from jax._src.config import config
 from jax._src.util import prod, safe_zip
 from jax._src.lib import xla_client as xc
 from jax._src.api import device_put
+from jax._src.numpy.ndarray import ndarray
 from jax.interpreters import pxla, xla, mlir
-from jax.experimental.sharding import (Sharding, SingleDeviceSharding,
-                                       XLACompatibleSharding)
+from jax.experimental.sharding import (
+    Sharding, SingleDeviceSharding, XLACompatibleSharding, PmapSharding,
+    device_replica_id_map)
 
 Shape = Tuple[int, ...]
 Device = xc.Device
 DeviceArray = xc.Buffer
 Index = Tuple[slice, ...]
 ArrayLike = Union[np.ndarray, DeviceArray]
+
+
+class _ArrayFastPathArgs(NamedTuple):
+  devices_indices_map: Mapping[Device, Optional[Index]]
+  addressable_device_assignment: Sequence[Device]
 
 
 class Shard:
@@ -52,11 +61,13 @@ class Shard:
   """
 
   def __init__(self, device: Device, sharding: Sharding, global_shape: Shape,
-               data: Optional[Array] = None):
+               data: Optional[Array] = None,
+               _fast_path_args: Optional[_ArrayFastPathArgs] = None):
     self.device = device
     self._sharding = sharding
     self._global_shape = global_shape
     self.data = data
+    self._fast_path_args = _fast_path_args
 
   def __repr__(self):
     try:
@@ -67,33 +78,41 @@ class Shard:
 
   @property
   def index(self) -> Index:
-    try:
-      device_indices_fn = self._sharding.device_indices
-    except AttributeError:
-      raise ValueError('Cannot calculate indices from sharding: '
-                       f'{self._sharding}. Please create a device to index '
-                       'mapping for your sharding.') from None
-    index = device_indices_fn(self.device, self._global_shape)
+    if self._fast_path_args is None:
+      try:
+        device_indices_map_fn = self._sharding.devices_indices_map
+      except AttributeError:
+        raise ValueError('Cannot calculate indices from sharding: '
+                         f'{self._sharding}. Please create a device to index '
+                         'mapping for your sharding.') from None
+      index = device_indices_map_fn(self._global_shape)[self.device]
+    else:
+      index = self._fast_path_args.devices_indices_map[self.device]
     assert index is not None
     return index
 
   @property
   def replica_id(self) -> int:
-    try:
-      device_replica_id_fn = self._sharding.device_replica_id_map  # pytype: disable=attribute-error
-    except AttributeError:
-      raise ValueError('Cannot calculate replica ids from sharding: '
-                       f'{self._sharding}. Please create a device to replica id '
-                       'mapping for your sharding.') from None
-    return device_replica_id_fn(self._global_shape)[self.device]
+    return device_replica_id_map(self._sharding, self._global_shape)[self.device]
+
+
+def _reconstruct_array(fun, args, arr_state, aval_state):
+  """Method to reconstruct a device array from a serialized state."""
+  np_value = fun(*args)
+  np_value.__setstate__(arr_state)
+  jnp_value = device_put(np_value)
+  jnp_value.aval = jnp_value.aval.update(**aval_state)
+  return jnp_value
 
 
 class Array:
   # TODO(yashkatariya): Add __slots__ here.
 
-  def __init__(self, shape: Shape, sharding: Sharding,
-               arrays: Union[Sequence[DeviceArray], Sequence[Array]], committed: bool):
-    self._shape = shape
+  def __init__(self, aval: core.ShapedArray, sharding: Sharding,
+               arrays: Union[Sequence[DeviceArray], Sequence[Array]],
+               committed: bool, _skip_checks: bool = False,
+               _fast_path_args: Optional[_ArrayFastPathArgs] = None):
+    self.aval = aval
     self._sharding = sharding
     # Extract DeviceArrays from arrays with `SingleDeviceSharding` to keep the
     # code handling `self._arrays` simpler.
@@ -104,30 +123,63 @@ class Array:
     # See https://jax.readthedocs.io/en/latest/faq.html#controlling-data-and-computation-placement-on-devices
     # for what committed means.
     self._committed = committed
+    # Optionally precomputed for performance.
+    self._fast_path_args = _fast_path_args
     self._npy_value = None
 
-    dtype = self._arrays[0].dtype
-    if config.jax_enable_checks:
-      assert all(db.dtype == dtype for db in self._arrays), (
-          "Input arrays to `Array` must have matching dtypes, "
-          f"got: {[db.dtype for db in self._arrays]}")
-    self.dtype = dtype
+    if not _skip_checks or config.jax_enable_checks:
+      ss = self.sharding.shard_shape(self.shape)
+      for db in self._arrays:
+        if db.shape != ss:
+          raise ValueError(
+              f"Expected shard shape {ss} doesn't match the buffer "
+              f"shape {db.shape} for buffer: {db}")
 
-    # Rearrange arrays based on the device assignment.
-    if isinstance(sharding, XLACompatibleSharding):
-      device_to_buffer = {db.device().id: db for db in self._arrays}
-      self._arrays = [device_to_buffer[device.id]
-                      for device in self.sharding._addressable_device_assignment]
+    if not _skip_checks or config.jax_enable_checks:
+      for db in self._arrays:
+        if db.dtype != self.dtype:
+          raise ValueError(
+              "Input buffers to `Array` must have matching dtypes. "
+              f"Got {db.dtype}, expected {self.dtype} for buffer: {db}")
+
+    # Don't rearrange if skip_checks is enabled because this assumes that the
+    # input buffers are already arranged properly. This usually happens when
+    # Array's are created as output of a JAX transformation
+    # (like pjit, xmap, etc).
+    if not _skip_checks:
+      # Rearrange arrays based on the device assignment.
+      # TODO(yashkatariya): Add a similar check for shardings that are not
+      # XLACompatibleSharding. But leave the rearragement to XLACompatibleSharding
+      # only.
+      if isinstance(sharding, XLACompatibleSharding):
+        if self._fast_path_args is None:
+          addressable_da = self.sharding._addressable_device_assignment
+        else:
+          addressable_da = self._fast_path_args.addressable_device_assignment
+        if len(self._arrays) != len(addressable_da):
+          raise ValueError(
+              f"Expected {len(addressable_da)} per-device arrays "
+              "(this is how many devices are addressable by the sharding), but "
+              f"got {len(self._arrays)}")
+        device_to_buffer = {db.device().id: db for db in self._arrays}
+        try:
+          self._arrays = [device_to_buffer[device.id]
+                          for device in addressable_da]
+        except KeyError as e:
+          array_device_ids = set(a.device().id for a in self._arrays)
+          addressable_device_ids = set(d.id for d in addressable_da)
+          diff = set(array_device_ids) - set(addressable_device_ids)
+          raise ValueError(
+              f"Some per-device arrays are placed on devices {diff}, which are "
+              f"not used in the specified sharding {self.sharding}") from e
 
   @property
   def shape(self) -> Shape:
-    return self._shape
+    return self.aval.shape
 
-  # TODO(yashkatariya): Remove this and take aval as an input to account for
-  # weak types.
   @property
-  def aval(self) -> core.ShapedArray:
-    return core.ShapedArray(self.shape, self.dtype)
+  def dtype(self):
+    return self.aval.dtype
 
   @property
   def ndim(self):
@@ -174,9 +226,9 @@ class Array:
     return oct(self._value)  # type: ignore
 
   def __index__(self):
-    return operator.index(self._value)
+    return op.index(self._value)
 
-  def to_bytes(self, order="C"):
+  def tobytes(self, order="C"):
     return self._value.tobytes(order)
 
   def tolist(self):
@@ -208,13 +260,17 @@ class Array:
     else:
       raise TypeError(self.dtype)
 
+  def is_fully_replicated(self) -> bool:
+    return self.shape == self._arrays[0].shape
+
   def __repr__(self):
     prefix = '{}('.format(self.__class__.__name__.lstrip('_'))
-    # TODO(yashkatariya): Add weak_type to the repr and handle weak_type
-    # generally too.
-    dtype_str = f'dtype={self.dtype.name})'
+    if self.aval is not None and self.aval.weak_type:
+      dtype_str = f'dtype={self.dtype.name}, weak_type=True)'
+    else:
+      dtype_str = f'dtype={self.dtype.name})'
 
-    if self.is_fully_addressable():
+    if self.is_fully_addressable() or self.is_fully_replicated():
       line_width = np.get_printoptions()["linewidth"]
       s = np.array2string(self._value, prefix=prefix, suffix=',',
                           separator=', ', max_line_width=line_width)
@@ -224,13 +280,46 @@ class Array:
         sep = ' ' * len(prefix)
       return f"{prefix}{s},{sep}{dtype_str}"
     else:
-      return f"{prefix}{self.shape}{dtype_str}"
+      return f"{prefix}{self.shape}, {dtype_str}"
 
   def is_fully_addressable(self) -> bool:
     return self.sharding.is_fully_addressable()
 
-  def __array__(self, dtype=None):
+  def __array__(self, dtype=None, context=None):
     return np.asarray(self._value, dtype=dtype)
+
+  def __dlpack__(self):
+    from jax.dlpack import to_dlpack  # pylint: disable=g-import-not-at-top
+    return to_dlpack(self)
+
+  def __reduce__(self):
+    fun, args, arr_state = self._value.__reduce__()  # type: ignore
+    aval_state = {'weak_type': self.aval.weak_type,
+                  'named_shape': self.aval.named_shape}
+    return (_reconstruct_array, (fun, args, arr_state, aval_state))
+
+  def unsafe_buffer_pointer(self):
+    assert len(self._arrays) == 1
+    return self._arrays[0].unsafe_buffer_pointer()
+
+  @property
+  def __cuda_array_interface__(self):
+    assert len(self._arrays) == 1
+    return self._arrays[0].__cuda_array_interface__  # pytype: disable=attribute-error  # bind-properties
+
+  # TODO(yashkatariya): Remove this method when everyone is using devices().
+  def device(self) -> Device:
+    self._check_if_deleted()
+    device_set = self.sharding.device_set
+    if len(device_set) == 1:
+      single_device, = device_set
+      return single_device
+    raise ValueError('Length of devices is greater than 1. '
+                     'Please use `.devices()`.')
+
+  def devices(self) -> List[Device]:
+    self._check_if_deleted()
+    return list(self.sharding.device_set)
 
   @pxla.maybe_cached_property
   def addressable_shards(self) -> Sequence[Shard]:
@@ -241,8 +330,10 @@ class Array:
       device = db.device()
       # Wrap the device arrays in `Array` until C++ returns an Array instead
       # of a DA.
-      array = Array(db.shape, SingleDeviceSharding(device), [db], committed=True)
-      out.append(Shard(device, self.sharding, self.shape, array))
+      array = Array(db.aval, SingleDeviceSharding(device), [db],
+                    committed=self._committed, _skip_checks=True)
+      out.append(Shard(
+          device, self.sharding, self.shape, array, self._fast_path_args))
     return out
 
   def delete(self):
@@ -253,9 +344,12 @@ class Array:
     self._arrays = None
     self._npy_value = None
 
+  def is_deleted(self):
+    return all(buf.is_deleted() for buf in self._arrays)
+
   def _check_if_deleted(self):
     if self._arrays is None:
-      raise ValueError("Array has been deleted.")
+      raise RuntimeError("Array has been deleted.")
 
   def block_until_ready(self):
     self._check_if_deleted()
@@ -279,12 +373,18 @@ class Array:
   @property
   def _value(self) -> np.ndarray:
     self._check_if_deleted()
-    if not self.is_fully_addressable():
-      raise RuntimeError("Fetching value for `jax.Array` that spans "
-                         "non-addressable devices is not possible. You can use "
-                         "`jax.experimental.multihost_utils.process_allgather` "
-                         "for this use case.")
+
     if self._npy_value is None:
+      if self.is_fully_replicated():
+        self._npy_value = np.asarray(self._arrays[0])  # type: ignore
+        return cast(np.ndarray, self._npy_value)
+
+      if not self.is_fully_addressable():
+        raise RuntimeError("Fetching value for `jax.Array` that spans "
+                           "non-addressable devices is not possible. You can use "
+                           "`jax.experimental.multihost_utils.process_allgather` "
+                           "for this use case.")
+
       self.copy_to_host_async()
       npy_value = np.empty(self.shape, self.dtype)
 
@@ -296,28 +396,37 @@ class Array:
 
       for s in self.addressable_shards:
         if not replica_id_exists or s.replica_id == 0:
-          npy_value[s.index] = s.data._arrays[0].to_py()  # type: ignore  # [union-attr]
+          npy_value[s.index] = np.asarray(s.data._arrays[0])  # type: ignore  # [union-attr]
       self._npy_value = npy_value  # type: ignore
     # https://docs.python.org/3/library/typing.html#typing.cast
     return cast(np.ndarray, self._npy_value)
 
+# explicitly set to be unhashable. Same as what device_array.py does.
+setattr(Array, "__hash__", None)
+
 
 def make_array_from_callback(shape: Shape, sharding: Sharding,
                              data_callback: Callable[[Optional[Index]], ArrayLike]) -> Array:
+  device_to_index_map = sharding.devices_indices_map(shape)
+  # Use addressable_devices here instead of `_addressable_device_assignment`
+  # because `_addressable_device_assignment` is only available on
+  # `XLACompatibleSharding` and this function is supposed to work for every
+  # `Sharding`.
   arrays = [
-      device_put(data_callback(sharding.device_indices(device, shape)), device)
+      device_put(data_callback(device_to_index_map[device]), device)
       for device in sharding.addressable_devices
   ]
-  return Array(shape, sharding, arrays, committed=True)
+  aval = core.ShapedArray(shape, arrays[0].dtype, weak_type=False)
+  return Array(aval, sharding, arrays, committed=True)
 
 
-core.pytype_aval_mappings[Array] = lambda x: core.ShapedArray(x.shape, x.dtype)
-xla.pytype_aval_mappings[Array] = lambda x: core.ShapedArray(x.shape, x.dtype)
+core.pytype_aval_mappings[Array] = abstract_arrays.canonical_concrete_aval
+xla.pytype_aval_mappings[Array] = op.attrgetter('aval')
 xla.canonicalize_dtype_handlers[Array] = pxla.identity
-api_util._shaped_abstractify_handlers[Array] = \
-    lambda x: core.ShapedArray(x.shape, x.dtype)
+api_util._shaped_abstractify_handlers[Array] = op.attrgetter('aval')
 ad_util.jaxval_adders[Array] = lax_internal.add
 ad_util.jaxval_zeros_likers[Array] = lax_internal.zeros_like_array
+ndarray.register(Array)
 
 
 def _array_mlir_constant_handler(val, canonicalize_types=True):
@@ -340,28 +449,76 @@ def _device_put_array(x, device: Optional[Device]):
 dispatch.device_put_handlers[Array] = _device_put_array
 
 
-def _array_shard_arg(x, devices, indices, mode):
-  # TODO(yashkatariya): Remove the `mode` handling and try to consolidate the
-  # code paths.
-  if mode == pxla.InputsHandlerMode.pmap:
-    # sharding mismatch between `Array` and pmap sharding is checked in api.py's
-    # `_check_in_pmap_sharding_with_arrays` function.
-    if isinstance(x.sharding, SingleDeviceSharding):
-      return pxla._shard_device_array(x, devices, indices, mode)
+def _array_pmap_shard_arg(x, devices, indices, mode):
+  if isinstance(x.sharding, SingleDeviceSharding):
+    return pxla._shard_device_array(x, devices, indices, mode)
+
+  if x._fast_path_args is None:
+    x_indices = tuple(x.sharding.devices_indices_map(x.shape).values())
+  else:
+    x_indices = tuple(x._fast_path_args.devices_indices_map.values())
+
+  # If the sharding of Array does not match pmap's sharding then take the slow
+  # path which is similar to what SDA does. This slow path reroute only happens
+  # for `pmap`.
+  if indices == x_indices:
     return [buf if buf.device() == d else buf.copy_to_device(d)
             for buf, d in safe_zip(x._arrays, devices)]
   else:
-    return x._arrays
+    return pxla._shard_sharded_device_array_slow_path(x, devices, indices, mode)
+
+
+def _array_shard_arg(x, devices, indices, mode):
+  if mode == pxla.InputsHandlerMode.pmap:
+    return _array_pmap_shard_arg(x, devices, indices, mode)
+  else:
+    if isinstance(x.sharding, SingleDeviceSharding):
+      return [buf if buf.device() == d else buf.copy_to_device(d)
+              for buf, d in safe_zip(x._arrays, devices)]
+    # If PmapSharding exists, then do a round trip via host. This will happen
+    # if the input Array containing PmapSharding takes the jit path
+    # i.e. `apply_primitive` or `xla_callable_uncached`. `jit(pmap)` is the most
+    # common case where this will happen.
+    elif isinstance(x.sharding, PmapSharding):
+      return pxla.device_put(x._value, devices, replicate=True)
+    else:
+      return x._arrays
 pxla.shard_arg_handlers[Array] = _array_shard_arg
 
 
-def _array_global_result_handler(global_aval, out_sharding):
-  return lambda bufs: Array(global_aval.shape, out_sharding, bufs, committed=True)
+def _array_global_result_handler(global_aval, out_sharding, committed,
+                                 is_out_sharding_from_xla):
+  if global_aval.dtype == dtypes.float0:
+    return lambda _: np.zeros(global_aval.shape, dtypes.float0)  # type: ignore
+  if core.is_opaque_dtype(global_aval.dtype):
+    return global_aval.dtype._rules.global_sharded_result_handler(
+        global_aval, out_sharding, committed, is_out_sharding_from_xla)
+
+  # Calculate the indices and addressable device assignment once during
+  # compilation and pass it to the constructor.
+  _array_fast_path_args = _ArrayFastPathArgs(
+      out_sharding.devices_indices_map(global_aval.shape),
+      out_sharding._addressable_device_assignment)
+  return lambda bufs: Array(global_aval, out_sharding, bufs,
+                            committed=committed, _skip_checks=True,
+                            _fast_path_args=_array_fast_path_args)
 pxla.global_result_handlers[(core.ShapedArray, pxla.OutputType.Array)] = _array_global_result_handler
 pxla.global_result_handlers[(core.ConcreteArray, pxla.OutputType.Array)] = _array_global_result_handler
+pxla.global_result_handlers[(core.AbstractToken, pxla.OutputType.Array)] = lambda *_: lambda *_: core.token
 
 
+# Only used for Arrays that come out of pmap.
 def _array_local_result_handler(aval, sharding, indices):
-  return lambda bufs: Array(aval.shape, sharding, bufs, committed=True)
+  if core.is_opaque_dtype(aval.dtype):
+    return aval.dtype._rules.local_sharded_result_handler(
+        aval, sharding, indices)
+
+  # Calculate the indices and addressable device assignment once during
+  # compilation and pass it to the constructor.
+  _array_fast_path_args = _ArrayFastPathArgs(
+      sharding.devices_indices_map(aval.shape),
+      sharding._addressable_device_assignment)
+  return lambda bufs: Array(aval, sharding, bufs, committed=True,
+                            _skip_checks=True, _fast_path_args=_array_fast_path_args)
 pxla.local_result_handlers[(core.ShapedArray, pxla.OutputType.Array)] = _array_local_result_handler
 pxla.local_result_handlers[(core.ConcreteArray, pxla.OutputType.Array)] = _array_local_result_handler

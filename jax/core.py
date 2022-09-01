@@ -25,9 +25,10 @@ import operator
 from operator import attrgetter
 import threading
 import types
-from typing import (Any, Callable, ClassVar, DefaultDict, Dict, Generator,
-                    Iterator, List, NamedTuple, Optional, Sequence, Set, Tuple,
-                    Type, Union, cast, Iterable, Hashable)
+from typing import (Any, Callable, ClassVar, DefaultDict, Dict,
+                    Generator, Hashable, Iterable, Iterator, List,
+                    NamedTuple, Optional, Sequence, Set, Tuple, Type,
+                    Union, cast)
 import warnings
 from weakref import ref
 
@@ -42,8 +43,8 @@ from jax import linear_util as lu
 
 from jax._src import source_info_util
 from jax._src.util import (safe_zip, safe_map, curry, prod, tuple_insert,
-                        tuple_delete, as_hashable_function,
-                        HashableFunction, HashableWrapper, weakref_lru_cache)
+                           tuple_delete, as_hashable_function,
+                           HashableFunction, HashableWrapper, weakref_lru_cache)
 import jax._src.pretty_printer as pp
 from jax._src import lib
 from jax._src.lib import jax_jit
@@ -500,7 +501,8 @@ def escaped_tracer_error(tracer, detail=None):
   num_frames = FLAGS.jax_tracer_error_num_traceback_frames
   msg = ('Encountered an unexpected tracer. A function transformed by JAX '
          'had a side effect, allowing for a reference to an intermediate value '
-         f'with shape {tracer.shape} and dtype {tracer.dtype} to escape.\n'
+         f'with type {tracer.aval.str_short()} wrapped in a '
+         f'{type(tracer).__name__} to escape the scope of the transformation.\n'
          'JAX transformations require that functions explicitly return their '
          'outputs, and disallow saving intermediate values to global state.')
   dbg = getattr(tracer, '_debug_info', None)
@@ -1189,17 +1191,25 @@ def concrete_or_error(force: Any, val: Any, context=""):
 
 
 # TODO(frostig,mattjj): achieve this w/ a protocol instead of registry?
-custom_eltypes: Set[Any] = set()
+
+opaque_dtypes: Set[Any] = set()
+
+# TODO(frostig): update inliners of the four functions below to call them
+def has_opaque_dtype(x: Any):
+  return is_opaque_dtype(get_aval(x).dtype)
+
+def is_opaque_dtype(dtype):
+  return type(dtype) in opaque_dtypes
 
 def _short_dtype_name(dtype) -> str:
-  if type(dtype) in custom_eltypes:
+  if type(dtype) in opaque_dtypes:
     return str(dtype)
   else:
     return (dtype.name.replace('float', 'f').replace('uint'   , 'u')
                       .replace('int'  , 'i').replace('complex', 'c'))
 
 def _dtype_object(dtype):
-  return dtype if type(dtype) in custom_eltypes else np.dtype(dtype)
+  return dtype if type(dtype) in opaque_dtypes else np.dtype(dtype)
 
 class UnshapedArray(AbstractValue):
   __slots__ = ['dtype', 'weak_type']
@@ -1404,7 +1414,12 @@ class ConcreteArray(ShapedArray):
   _complex         = concretization_function_error(complex, True)
 
 def primal_dtype_to_tangent_dtype(primal_dtype):
-  if not dtypes.issubdtype(primal_dtype, np.inexact):
+  # TODO(frostig,mattjj): determines that all opaque dtypes have
+  # float0 tangent type, which works fine for all our current opaque
+  # dtype applications. We may some day want to delegate this
+  # decision to the dtype rules.
+  if (is_opaque_dtype(primal_dtype) or
+      not dtypes.issubdtype(primal_dtype, np.inexact)):
     return dtypes.float0
   else:
     return primal_dtype

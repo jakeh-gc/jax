@@ -35,6 +35,7 @@ from jax import linear_util as lu
 from jax._src import ad_util
 from jax._src import device_array
 from jax._src import dtypes
+from jax._src.lib import version as jaxlib_version
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import chlo
 from jax._src.lib.mlir.dialects import mhlo
@@ -137,8 +138,8 @@ def dtype_to_ir_type(dtype: Union[np.dtype, np.generic]) -> ir.Type:
 
 def _array_ir_types(aval: Union[core.ShapedArray, core.DShapedArray]
                     ) -> Sequence[ir.Type]:
-  if type(aval.dtype) in core.custom_eltypes:
-    return aval.dtype.aval_to_ir_types(aval)
+  if core.is_opaque_dtype(aval.dtype):
+    return aval.dtype._rules.aval_to_ir_types(aval)
   return (ir.RankedTensorType.get(aval.shape, dtype_to_ir_type(aval.dtype)),)
 
 def _dynamic_array_ir_types(aval: core.ShapedArray) -> Sequence[ir.Type]:
@@ -194,6 +195,9 @@ _constant_handlers : Dict[type, ConstantHandler] = {}
 
 def register_constant_handler(type_: type, handler_fun: ConstantHandler):
   _constant_handlers[type_] = handler_fun
+
+def get_constant_handler(type_: type) -> ConstantHandler:
+  return _constant_handlers[type_]
 
 def ir_constants(val: Any,
                  canonicalize_types: bool = True) -> Sequence[ir.Value]:
@@ -299,7 +303,7 @@ for ptype, dtype in dtypes.python_scalar_dtypes.items():
   register_constant_handler(ptype, partial(_python_scalar_handler, dtype))
 
 def _device_array_constant_handler(val, canonicalize_types):
-  return _ndarray_constant_handler(val.device_buffer.to_py(),
+  return _ndarray_constant_handler(np.asarray(val.device_buffer),
                                    canonicalize_types)
 for t in device_array.device_array_types:
   register_constant_handler(t, _device_array_constant_handler)
@@ -337,7 +341,10 @@ def make_ir_context() -> ir.Context:
   """Creates an MLIR context suitable for JAX IR."""
   context = ir.Context()
   mhlo.register_mhlo_dialect(context)
-  chlo.register_chlo_dialect(context)
+  if jax._src.lib.mlir_api_version < 33:
+    chlo.register_chlo_dialect(context)
+  else:
+    chlo.register_dialect(context)
   return context
 
 
@@ -601,10 +608,13 @@ def lower_jaxpr_to_module(
     ]
   out_avals = jaxpr.out_avals
   if result_shardings is not None:
-    out_avals = [
-        sharded_aval(out_aval, out_sharding)
-        for out_aval, out_sharding in zip(out_avals, result_shardings)
-    ]
+    out_avals = []
+    for out_aval, out_sharding in zip(jaxpr.out_avals, result_shardings):
+      if (out_aval is not core.abstract_token and
+          core.is_opaque_dtype(out_aval.dtype)):
+        out_aval, = out_aval.dtype._rules.physical_avals(out_aval)
+      out_avals.append(sharded_aval(out_aval, out_sharding))
+
   platforms_with_donation = ("cuda", "rocm", "tpu")
   if platform in platforms_with_donation:
     input_output_aliases, donated_args = _set_up_aliases(
@@ -809,19 +819,19 @@ def lower_jaxpr_to_fun(
     token_types = [token_type() for _ in effects]
   input_types = [*token_types, *input_types]
   output_types = [*output_token_types, *token_types, *output_types]
-  if input_output_aliases:
+  if input_output_aliases is not None:
     token_input_output_aliases = [None] * num_tokens
     input_output_aliases = [*token_input_output_aliases, *input_output_aliases]
     # Update the existing aliases to account for the new output values
     input_output_aliases = [None if a is None else a + num_output_tokens +
                             num_tokens for a in input_output_aliases]
-  if arg_shardings:
+  if arg_shardings is not None:
     token_shardings = [None] * num_tokens
     arg_shardings = [*token_shardings, *arg_shardings]
-  if result_shardings:
+  if result_shardings is not None:
     token_shardings = [None] * (num_tokens + num_output_tokens)
     result_shardings = [*token_shardings, *result_shardings]
-  if replicated_args:
+  if replicated_args is not None:
     token_replicated_args = [False] * num_tokens
     replicated_args = [*token_replicated_args, *replicated_args]
   flat_input_types = util.flatten(input_types)
@@ -889,7 +899,8 @@ def lower_jaxpr_to_fun(
   with ir.InsertionPoint(entry_block):
     flat_args = entry_block.arguments
     if not use_sharding_annotations and ir_arg_shardings is not None:
-      flat_args = map(wrap_with_sharding_op, flat_args, ir_arg_shardings)
+      flat_args = [a if s is None else wrap_with_sharding_op(a, s)
+                   for a, s in zip(flat_args, ir_arg_shardings)]
 
     unflattened_args = util.unflatten(flat_args, map(len, input_types))
     # We separate out the token inputs and the usual inputs. The token inputs
@@ -926,8 +937,8 @@ def lower_jaxpr_to_fun(
         outs.append(out)
     flat_outputs = util.flatten(outs)
     if not use_sharding_annotations and ir_result_shardings is not None:
-      flat_outputs = map(wrap_with_sharding_op, flat_outputs,
-                         ir_result_shardings)
+      flat_outputs = [o if s is None else wrap_with_sharding_op(o, s)
+                      for o, s in zip(flat_outputs, ir_result_shardings)]
 
     func_dialect.ReturnOp(flat_outputs)
 
@@ -1095,6 +1106,7 @@ def lower_fun(fun: Callable, multiple_results: bool = True) -> Callable:
       jaxpr, _, consts = pe.trace_to_jaxpr_dynamic2(wrapped_fun)
     else:
       jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(wrapped_fun, ctx.avals_in)
+      # TODO(frostig,mattjj): check ctx.avals_out against jaxpr avals out?
 
     out, tokens = jaxpr_subcomp(
         ctx.module_context, jaxpr, ctx.tokens_in, _ir_consts(consts),
@@ -1542,7 +1554,7 @@ def emit_python_callback(
     ) -> Tuple[List[ir.Value], Any, Any]:
   """Emits MHLO that calls back to a provided Python function."""
   platform = ctx.module_context.platform
-  if platform in {"tpu"} and jax._src.lib.version < (0, 3, 15):
+  if platform in {"tpu"} and jaxlib_version < (0, 3, 15):
     raise ValueError(
         "`EmitPythonCallback` on TPU only supported on jaxlib >= 0.3.15")
   if platform not in {"cpu", "cuda", "rocm", "tpu"}:

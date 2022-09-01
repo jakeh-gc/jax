@@ -21,7 +21,7 @@ load(
     "pytype_library",
 )
 
-licenses(["notice"])  # Apache 2
+licenses(["notice"])
 
 package(default_visibility = ["//visibility:private"])
 
@@ -36,6 +36,7 @@ jax_test(
 jax_test(
     name = "dynamic_api_test",
     srcs = ["dynamic_api_test.py"],
+    disable_configs = ["cpu_jax_array"],
     shard_count = 2,
 )
 
@@ -77,6 +78,10 @@ jax_test(
 jax_test(
     name = "custom_object_test",
     srcs = ["custom_object_test.py"],
+    # TODO(yashkatariya,mattjj,phawkins): Enable custom_object_test once
+    # `ExecuteReplicated` supports the use case of having more
+    # than 1 buffer on a single device.
+    disable_configs = ["cpu_jax_array"],
 )
 
 py_test(
@@ -89,17 +94,8 @@ py_test(
 )
 
 py_test(
-    name = "distributed_multinode_test",
-    srcs = ["distributed_multinode_test.py"],
-    deps = [
-        "//jax",
-        "//jax:test_util",
-    ],
-)
-
-py_test(
-    name = "distributed_test",
-    srcs = ["distributed_test.py"],
+    name = "multiprocess_gpu_test",
+    srcs = ["multiprocess_gpu_test.py"],
     args = [
         "--exclude_test_targets=MultiProcessGpuTest",
     ],
@@ -175,6 +171,7 @@ py_test(
 jax_test(
     name = "xmap_test",
     srcs = ["xmap_test.py"],
+    disable_configs = ["cpu_jax_array"],
     shard_count = {
         "cpu": 10,
         "gpu": 4,
@@ -189,6 +186,7 @@ jax_test(
 jax_test(
     name = "pjit_test",
     srcs = ["pjit_test.py"],
+    disable_configs = ["cpu_jax_array"],
     shard_count = {
         "cpu": 5,
         "gpu": 5,
@@ -314,9 +312,9 @@ jax_test(
     name = "lax_control_flow_test",
     srcs = ["lax_control_flow_test.py"],
     shard_count = {
-        "cpu": 10,
+        "cpu": 20,
         "gpu": 20,
-        "tpu": 10,
+        "tpu": 20,
         "iree": 10,
     },
 )
@@ -526,9 +524,9 @@ jax_test(
     name = "pmap_test",
     srcs = ["pmap_test.py"],
     shard_count = {
-        "cpu": 10,
-        "gpu": 10,
-        "tpu": 10,
+        "cpu": 30,
+        "gpu": 30,
+        "tpu": 30,
     },
     tags = ["multiaccelerator"],
     deps = [
@@ -584,10 +582,10 @@ jax_test(
     name = "random_test",
     srcs = ["random_test.py"],
     shard_count = {
-        "cpu": 10,
-        "gpu": 10,
-        "tpu": 10,
-        "iree": 10,
+        "cpu": 20,
+        "gpu": 20,
+        "tpu": 20,
+        "iree": 20,
     },
 )
 

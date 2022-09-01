@@ -34,9 +34,11 @@ from jax._src import test_util as jtu
 from jax import tree_util
 from jax._src.util import unzip2
 from jax.experimental import maps
+from jax.experimental import array
 from jax.ad_checkpoint import checkpoint as new_checkpoint, checkpoint_policies
 import jax.numpy as jnp  # scan tests use numpy
 import jax.scipy as jsp
+from jax._src.lax import control_flow as lax_control_flow
 from jax._src.lax.control_flow import for_loop
 
 from jax.config import config
@@ -99,7 +101,7 @@ SCAN_IMPLS_WITH_FOR = [
     (partial(lax.scan, unroll=2), 'unroll2'),
     (scan_with_new_checkpoint , 'new_checkpoint'),
     (scan_with_new_checkpoint2, 'new_checkpoint2'),
-    (scan_with_for, 'for'),
+    (scan_with_for, 'for_loop'),
 ]
 
 
@@ -136,9 +138,9 @@ class LaxControlFlowTest(jtu.JaxTestCase):
 
   def setUp(self):
     super().setUp()
-    jax._src.lax.control_flow._initial_style_open_jaxpr.cache_clear()
-    jax._src.lax.control_flow._initial_style_jaxpr.cache_clear()
-    jax._src.lax.control_flow._initial_style_jaxprs_with_common_consts.cache_clear()
+    lax_control_flow._initial_style_open_jaxpr.cache_clear()
+    lax_control_flow._initial_style_jaxpr.cache_clear()
+    lax_control_flow._initial_style_jaxprs_with_common_consts.cache_clear()
 
   def testCallableErrors(self):
     not_callable = 42
@@ -1594,6 +1596,8 @@ class LaxControlFlowTest(jtu.JaxTestCase):
 
     if scan is scan_with_new_checkpoint2:
       rtol = {np.float64: 1e-12, np.float32: 1e-4}
+    elif scan is scan_with_for:
+      rtol = {np.float64: 1e-12, np.float32: 1e-4}
     else:
       rtol = {np.float64: 1e-14, np.float32: 1e-4}
 
@@ -1607,7 +1611,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
        "jit_scan": jit_scan, "jit_f": jit_f, "scan": scan_impl}
       for jit_scan in [False, True]
       for jit_f in [False, True]
-      for scan_impl, scan_name in SCAN_IMPLS)
+      for scan_impl, scan_name in SCAN_IMPLS_WITH_FOR)
   @jtu.skip_on_flag("jax_skip_slow_tests", True)
   def testScanGrad(self, jit_scan, jit_f, scan):
     rng = self.rng()
@@ -1633,13 +1637,19 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     expected = jax.grad(lambda c, as_: list(scan_reference(f, c, as_))[0].sum())(c, as_)
     if scan is scan_with_new_checkpoint:
       rtol = {np.float32: 5e-5, np.float64: 1e-13}
+      atol = 1e-5
+    elif scan is scan_with_for:
+      rtol = {np.float32: 2e-5, np.float64: 1e-13}
+      atol = {np.float32: 6e-2, np.float64: 1e-13}
     else:
       rtol = {np.float32: 2e-5, np.float64: 1e-13}
-    self.assertAllClose(ans, expected, check_dtypes=False, rtol=rtol, atol=1e-5)
+      atol = 1e-5
+    self.assertAllClose(ans, expected, check_dtypes=False, rtol=rtol, atol=atol)
 
     rtol = 5e-3 if scan is not scan_with_new_checkpoint2 else 5e-2
+    atol = 5e-2 if "tpu" in jtu.device_under_test() else 1e-3
     jtu.check_grads(partial(scan, f), (c, as_), order=2, modes=["rev"],
-                    atol=1e-3, rtol=rtol)
+                    atol=atol, rtol=rtol)
 
   @jtu.skip_on_devices("tpu")  # TPU lacks precision for this test.
   @jtu.skip_on_flag("jax_skip_slow_tests", True)
@@ -1782,7 +1792,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
   @parameterized.named_parameters(
       {"testcase_name": f"_{scan_name}",
        "scan": scan_impl}
-      for scan_impl, scan_name in SCAN_IMPLS)
+      for scan_impl, scan_name in SCAN_IMPLS_WITH_FOR)
   def testScanHigherOrderDifferentiation(self, scan):
     d = 0.75
     def f(c, a):
@@ -1803,7 +1813,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
        "scan": scan_impl}
       for jit_scan in [False, True]
       for jit_f in [False, True]
-      for scan_impl, scan_name in SCAN_IMPLS
+      for scan_impl, scan_name in SCAN_IMPLS_WITH_FOR
       for in_axes in itertools.product([None, 0, 1], [None, 0, 1, 2])
       if in_axes != (None, None))
   def testScanVmap(self, jit_scan, jit_f, in_axes, scan):
@@ -1869,7 +1879,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
       {"testcase_name": "_impl={}".format(scan_name), "scan": scan_impl}
-      for scan_impl, scan_name in SCAN_IMPLS)
+      for scan_impl, scan_name in SCAN_IMPLS_WITH_FOR)
   def testScanVmapFixpoint(self, scan):
     def f(carry_init):
       def scan_body(c, x):
@@ -2451,7 +2461,10 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     x = rng.randn(32, 2, 32).astype('float32')  # numpy.ndarray, not DeviceArray
     _, vjp_fun = jax.vjp(cumprod, x)
     *_, ext_res = vjp_fun.args[0].args[0]
-    self.assertIsInstance(ext_res, jnp.DeviceArray)
+    if config.jax_array:
+      self.assertIsInstance(ext_res, array.Array)
+    else:
+      self.assertIsInstance(ext_res, jnp.DeviceArray)
 
   def test_scan_vmap_collectives(self):
     def scan_f(state, x):
@@ -2543,7 +2556,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
 
   @parameterized.named_parameters(
       {"testcase_name": "impl={}".format(scan_name), "scan": scan_impl}
-      for scan_impl, scan_name in SCAN_IMPLS)
+      for scan_impl, scan_name in SCAN_IMPLS_WITH_FOR)
   def test_scan_hoisting_consts(self, scan):
     A = jnp.arange(4.).reshape(2, 2)
     B = jnp.arange(4.).reshape(2, 2) + 1.
@@ -2778,6 +2791,19 @@ class ForLoopTransformationTest(jtu.JaxTestCase):
               if v.aval.shape == (2, 32)]
     self.assertLen(consts, 2)
 
+    def loss(A):
+      def step(x, i):
+        return jnp.matmul(A, x), None
+      init_x = jnp.zeros(A.shape[-1:])
+      last_x, _ = for_loop.scan(step, init_x, jnp.arange(10))
+      return jnp.sum(last_x)
+
+    A = jnp.zeros((3, 3))
+    # The second DUS was unnecessarily replicating A across time.
+    # We check XLA because _scan_impl is "underneath" the jaxpr language.
+    s = str(jax.xla_computation(jax.grad(loss))(A).as_hlo_text())
+    assert s.count("dynamic-update-slice(") < 2
+
   def test_for_loop_fixpoint_correctly_identifies_loop_varying_residuals(self):
 
     def body(i, refs):
@@ -2799,6 +2825,39 @@ class ForLoopTransformationTest(jtu.JaxTestCase):
     np.testing.assert_allclose(actual_tangents[0], expected_tangents[0])
     np.testing.assert_allclose(actual_tangents[1], expected_tangents[1])
 
+  @parameterized.named_parameters(
+      {"testcase_name": "_jit_for={}_f={}_nsteps={}".format(
+        jit_for, for_body_name, nsteps),
+        "jit_for": jit_for, "f": for_body, "body_shapes": body_shapes,
+        "ref": ref, "n": nsteps}
+      for jit_for in [False, True]
+      for for_body_name, for_body, ref, body_shapes, nsteps in [
+        ("swap", for_body_swap, swap_ref, [(4,), (4,)], 4),
+        ("swap_swap", for_body_swap_swap, swap_swap_ref, [(4,), (4,)], 4),
+        ("sincos", for_body_sincos, sincos_ref, [(4,), (4,)], 4),
+        ("sincostan", for_body_sincostan, sincostan_ref, [(4,), (4,)], 4),
+        ("accum", for_body_accum, accum_ref, [(4,), (4,)], 3),
+        ("sin_sq", for_body_sin_sq, sin_sq_ref, [(4,), (4,)], 4),
+        ("reverse", for_body_reverse, reverse_ref, [(4,), (4,)], 4),
+      ])
+  def test_for_grad(self, jit_for, f, ref, body_shapes, n):
+    for_ = for_loop.for_loop
+    rng = self.rng()
+
+    args = [rng.randn(*s) for s in body_shapes]
+
+    if jit_for:
+      for_ = jax.jit(for_, static_argnums=(0, 1))
+    tol = {np.float64: 1e-12, np.float32: 1e-4}
+    ans = jax.grad(lambda args: for_(         n, f, args)[1].sum())(args)
+    ans_discharged = jax.grad(
+        lambda args: for_reference(n, f, args)[1].sum())(args)
+    expected = jax.grad(lambda args: ref(*args)[1].sum())(args)
+    self.assertAllClose(ans, ans_discharged, check_dtypes=True, rtol=tol,
+                        atol=tol)
+    self.assertAllClose(ans, expected, check_dtypes=True, rtol=tol, atol=tol)
+    jtu.check_grads(lambda *args: for_(n, f, args)[1].sum(), args, order=3,
+                    rtol=5e-3)
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())
