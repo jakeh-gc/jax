@@ -115,6 +115,7 @@ LAX_OPS = [
     # TODO(b/143135720): on GPU, tanh has only ~float32 precision.
     op_record("tanh", 1, float_dtypes + complex_dtypes, jtu.rand_small,
               {np.float64: 1e-9, np.complex128: 1e-7}),
+    op_record("logistic", 1, float_dtypes + complex_dtypes, jtu.rand_default),
     op_record("sin", 1, float_dtypes + complex_dtypes, jtu.rand_default),
     op_record("cos", 1, float_dtypes + complex_dtypes, jtu.rand_default),
     op_record("atan2", 2, float_dtypes, jtu.rand_default),
@@ -552,6 +553,48 @@ class LaxTest(jtu.JaxTestCase):
           lhs, rhs, strides, padding, lhs_dilation, rhs_dilation)
 
     self._CheckAgainstNumpy(numpy_fun, fun, args_maker)
+
+  @parameterized.named_parameters(jtu.named_cases_from_sampler(lambda s: ({
+       "testcase_name": "_lhs_shape={}_rhs_shape={}"
+       "_dims={}".format(
+           jtu.format_shape_dtype_string(lhs_shape, dtype),
+           jtu.format_shape_dtype_string(rhs_shape, dtype),
+           ",".join(dim_nums)),
+       "lhs_shape": lhs_shape, "rhs_shape": rhs_shape, "dtype": dtype,
+       "dimension_numbers": dim_nums,
+       "feature_group_count": feature_group_count,
+       "batch_group_count": batch_group_count, "perms": perms
+    } for batch_group_count, feature_group_count in s([(1, 1), (2, 1), (1, 2)])
+      for lhs_shape, rhs_shape in s([
+          ((b * batch_group_count, i * feature_group_count),
+           (j * feature_group_count * batch_group_count, i))
+          for b, i, j in itertools.product([2, 3], repeat=3)])
+      for dtype in s(all_dtypes)
+      for dim_nums, perms in s([
+        (("NC", "OI", "NC"), ([0, 1], [0, 1])),
+      ]))))
+  def testConvGeneralDilated0D(self, lhs_shape, rhs_shape, dtype,
+                               feature_group_count, batch_group_count,
+                               dimension_numbers, perms):
+    if np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.bool_):
+      # TODO(b/183565702): Support integer convolutions on CPU/GPU.
+      if jtu.device_under_test() == "gpu":
+        raise SkipTest("Integer convolution not yet supported on GPU")
+    rng = jtu.rand_small(self.rng())
+    lhs_perm, rhs_perm = perms  # permute to compatible shapes
+
+    def args_maker():
+      return [lax.transpose(rng(lhs_shape, dtype), lhs_perm),
+              lax.transpose(rng(rhs_shape, dtype), rhs_perm)]
+
+    def fun(lhs, rhs):
+      return lax.conv_general_dilated(
+          lhs, rhs, window_strides=(), padding=(),
+          dimension_numbers=dimension_numbers,
+          feature_group_count=feature_group_count,
+          batch_group_count=batch_group_count)
+
+    self._CompileAndCheck(fun, args_maker)
 
   @parameterized.named_parameters(jtu.named_cases_from_sampler(lambda s: ({
        "testcase_name": "_lhs_shape={}_rhs_shape={}_strides={}_padding={}"
@@ -2244,9 +2287,8 @@ class LaxTest(jtu.JaxTestCase):
           [(3, 4, 5), (np.array([0, 2, 1]),), (0,)],
           [(3, 4, 5), (np.array([-1, -2]),), (0,)],
           [(3, 4, 5), (np.array([0, 2]), np.array([1, 3])), (0, 1)],
-          [(3, 4, 5), (np.array([0, 2]), np.array([1, 3])), (0, 2)],
+          [(3, 4, 5), (np.array([0, 2]), np.array([1, 3])), [0, 2]],
       ]))
-  @jax.numpy_rank_promotion('allow')  # Test explicitly exercises implicit rank promotion.
   def testIndexTake(self, shape, dtype, idxs, axes):
     rng = jtu.rand_default(self.rng())
     rand_idxs = lambda: tuple(rng(e.shape, e.dtype) for e in idxs)
@@ -2959,6 +3001,8 @@ class LazyConstantTest(jtu.JaxTestCase):
       for op, dtypes in unary_op_types.items())
   def testUnaryWeakTypes(self, op_name, rec_dtypes):
     """Test that all lax unary ops propagate weak_type information appropriately."""
+    if op_name == "bitwise_not":
+      raise unittest.SkipTest("https://github.com/google/jax/issues/12066")
     # Find a valid dtype for the function.
     for dtype in [np.float_, np.int_, np.complex_, np.bool_]:
       dtype = dtypes.canonicalize_dtype(dtype)

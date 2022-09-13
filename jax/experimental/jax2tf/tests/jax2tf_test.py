@@ -488,8 +488,8 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
       dict(testcase_name=f"function={with_function}",
            with_function=with_function)
       for with_function in [False, True]))
-  def test_gradients_unused_argument_readme(self, with_function=True):
-    # x2 and x3 are not used. x3 has integer type.
+  def test_gradients_unused_argument_readme(self, with_function=False):
+    # x1 and x3 are not used. x3 has integer type.
     def fn(x0, x1, x2, x3):
       return x0 * 0. + x2 * 2.
 
@@ -536,7 +536,7 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
       dict(testcase_name=f"function={with_function}",
            with_function=with_function)
       for with_function in [False, True]))
-  def test_gradients_int_argument(self, with_function=True):
+  def test_gradients_int_argument(self, with_function=False):
     # https://github.com/google/jax/issues/6975
     # Also issue #6975.
     # An expanded version of test_gradients_unused_argument
@@ -1049,6 +1049,9 @@ class Jax2TfTest(tf_test_util.JaxToTfTestCase):
     self.ConvertAndCompare(jnp.sin, jnp.zeros((2, 3), jnp.float32))
 
   def test_randint(self):
+    if jtu.device_under_test() == "gpu" and config.jax2tf_default_experimental_native_lowering:
+      raise unittest.SkipTest("randint on GPU uses custom calls; not supported")
+
     def randint():
       return jax.random.randint(
           jax.random.PRNGKey(42), shape=(), minval=0, maxval=1)
@@ -1327,6 +1330,8 @@ class XlaCallModuleTest(tf_test_util.JaxToTfTestCase):
     self.assertAllClose(
         tf.nest.map_structure(lambda t: t.numpy(), res), jax_res)
 
+  # TODO(necula): figure out this failure
+  @jtu.skip_on_flag("jax2tf_default_experimental_native_lowering", True)
   def test_global_device_array(self):
 
     def create_gda(global_shape, global_mesh, mesh_axes, global_data=None):

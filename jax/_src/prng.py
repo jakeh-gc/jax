@@ -15,6 +15,7 @@
 
 import abc
 from functools import partial
+import operator as op
 from typing import Any, Callable, Hashable, Iterator, NamedTuple, Sequence
 
 import numpy as np
@@ -31,7 +32,7 @@ from jax.interpreters import mlir
 from jax.interpreters import pxla
 from jax.interpreters import xla
 from jax.experimental.sharding import (
-    MeshPspecSharding, SingleDeviceSharding, PmapSharding, OpShardingSharding)
+    MeshPspecSharding, PmapSharding, OpShardingSharding)
 
 from jax._src import dispatch
 from jax._src import dtypes
@@ -114,8 +115,7 @@ class PRNGKeyArrayMeta(abc.ABCMeta):
 
   def __instancecheck__(self, instance):
     try:
-      return (hasattr(instance, 'aval') and
-              isinstance(instance.aval, core.ShapedArray) and
+      return (isinstance(instance.aval, core.ShapedArray) and
               type(instance.aval.dtype) is KeyTy)
     except AttributeError:
       super().__instancecheck__(instance)
@@ -168,6 +168,10 @@ class PRNGKeyArray(metaclass=PRNGKeyArrayMeta):
   @property
   def dtype(self):
     return KeyTy(self.impl)
+
+  _device = property(op.attrgetter('_base_array._device'))
+  _committed = property(op.attrgetter('_base_array._committed'))
+  sharding = property(op.attrgetter('_base_array.sharding'))
 
   def _is_scalar(self):
     base_ndim = len(self.impl.key_shape)
@@ -364,7 +368,7 @@ class KeyTyRules:
     phys_handler_maker = pxla.global_result_handlers[
         (core.ShapedArray, output_type)]
 
-    if isinstance(out_sharding, SingleDeviceSharding):
+    if dispatch.is_single_device_sharding(out_sharding):
       phys_sharding = out_sharding
     elif isinstance(out_sharding, MeshPspecSharding):
       trailing_spec = [None] * len(key_shape)

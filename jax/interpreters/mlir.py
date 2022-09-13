@@ -35,6 +35,7 @@ from jax import linear_util as lu
 from jax._src import ad_util
 from jax._src import device_array
 from jax._src import dtypes
+from jax._src.lib import mlir_api_version
 from jax._src.lib import version as jaxlib_version
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import chlo
@@ -341,7 +342,7 @@ def make_ir_context() -> ir.Context:
   """Creates an MLIR context suitable for JAX IR."""
   context = ir.Context()
   mhlo.register_mhlo_dialect(context)
-  if jax._src.lib.mlir_api_version < 33:
+  if mlir_api_version < 33:
     chlo.register_chlo_dialect(context)
   else:
     chlo.register_dialect(context)
@@ -671,6 +672,12 @@ def module_to_string(module: ir.Module) -> str:
   module.operation.print(file=output, enable_debug_info=True,
                          print_generic_op_form=False)
   return output.getvalue()
+
+def module_to_bytecode(module: ir.Module) -> bytes:
+  output = io.BytesIO()
+  module.operation.write_bytecode(file=output)
+  return output.getvalue()
+
 
 def _set_up_aliases(avals_in, avals_out, donated_args):
   input_output_aliases = [None] * len(avals_in)

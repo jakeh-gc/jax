@@ -208,6 +208,7 @@ class JaxprEqn(NamedTuple):
   def replace(self, *args, **kwargs):
     return self._replace(*args, **kwargs)
 
+# TODO(mattjj): call typecheck rules here, so we don't form bad eqns
 def new_jaxpr_eqn(invars, outvars, primitive, params, effects, source_info=None):
   source_info = source_info or source_info_util.new_source_info()
   if config.jax_enable_checks:
@@ -1691,7 +1692,6 @@ _SPECIAL_DIMENSION_HANDLERS: Dict[type, DimensionHandler] = {}
 def _get_special_dim_handler(dim: DimSize) -> Optional[DimensionHandler]:
   if isinstance(dim, Tracer) and not config.jax_dynamic_shapes:
     return None
-  # TODO: look up DynamicJaxprTracer
   return _SPECIAL_DIMENSION_HANDLERS.get(type(dim))
 
 def _dim_handler_and_canonical(*dlist: DimSize) -> Tuple[DimensionHandler, Tuple[DimSize, ...]]:
@@ -1800,7 +1800,9 @@ def dimension_as_value(d: DimSize):
   return handler.as_value(*ds)
 
 def _canonicalize_dimension(dim: DimSize) -> DimSize:
-  if is_special_dim_size(dim):
+  if isinstance(dim, Tracer) and config.jax_dynamic_shapes:
+    return dim
+  elif is_special_dim_size(dim):
     return dim
   else:
     return operator.index(dim)
@@ -2162,6 +2164,7 @@ aval_mapping_handlers: Dict[Type, AvalMapHandlerPair] = {
     DShapedArray:   (_map_dshaped_array, _unmap_dshaped_array),
     ShapedArray:   (_map_shaped_array, _unmap_shaped_array),
     ConcreteArray: (_map_shaped_array, _unmap_shaped_array),
+    AbstractToken: (lambda _, __, a: a, lambda _, __, ___, a: a)
 }
 
 @contextmanager
